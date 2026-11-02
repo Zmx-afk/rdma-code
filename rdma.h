@@ -2,17 +2,43 @@
 #define __RDMA_TRANSMIT_H__
 
 
+#include <infiniband/verbs.h>
+#include <stdint.h>
+#include <string.h>
 #define RDMA_SERVER_PORT        9000
 #define RDMA_SERVER_IP          "192.168.254.100"
 #define RDMA_CLIENT_PORT        9001
 #define RDMA_CLIENT_IP          "192.168.254.100"
 
+#define RDMA_RECV_SLOTS        4
+
 #define RDMA_TIMEOUT_MS         2000
-#define RDMA_CQ_DEPTH            32
+#define RDMA_CQ_DEPTH            4096
 #define RDMA_BUFFER_SIZE        512
+#define RDMA_FILENAME               "a.txt"
 
+#include <rdma/rdma_cma.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
 
+typedef struct conn_manager_s
+{
 
+    struct ibv_mr *recv_mr;
+    struct ibv_mr *send_mr;
+
+    char *rbuffer;
+    char *sbuffer;
+
+}conn_manager_t;
+
+typedef struct file_type_s
+{
+    uint32_t magic;
+    size_t total;
+}file_type_t;
 
 static int rdma_wait_cm_event(struct rdma_event_channel *channel, enum rdma_cm_event_type expect,struct rdma_cm_event **out)
 {
@@ -73,15 +99,182 @@ static int rdma_create_queuepair(struct rdma_cm_id *id,struct ibv_pd **pd,struct
 
     //recvbuffer sendbuffer
 
-    return rdma_create_qp(id, *pd, &attr);;
+    return rdma_create_qp(id, *pd, &attr);
+
+}
+
+static int rdma_destroy_queuepair(struct rdma_cm_id *id,struct ibv_pd *pd,struct ibv_cq *cq)
+{
+    if(id->qp)
+    {
+        rdma_destroy_qp(id);
+    }
+
+    if(cq)
+    {
+        ibv_destroy_cq(cq);
+    }
+
+    if(pd)
+    {
+        ibv_dealloc_pd(pd);
+    }
+
+    return 0;
+}
+
+static int rdma_alloc_buffer(struct rdma_cm_id *cm_id,struct ibv_pd *pd)
+{
+    conn_manager_t *cm =(conn_manager_t*)calloc(1,sizeof(conn_manager_t));
+    if(!cm)
+    {
+        return -1;
+    }
+
+    cm->rbuffer = (char*)calloc(RDMA_RECV_SLOTS,RDMA_BUFFER_SIZE);
+    cm->sbuffer = (char*)calloc(1,RDMA_BUFFER_SIZE);
+    if(!cm->rbuffer||!cm->sbuffer)
+    {
+        return -1;
+    }
+
+    cm->send_mr = ibv_reg_mr(pd,cm->sbuffer,RDMA_BUFFER_SIZE,0);
+    cm->recv_mr = ibv_reg_mr(pd,cm->rbuffer,(size_t)RDMA_RECV_SLOTS * RDMA_BUFFER_SIZE,IBV_ACCESS_LOCAL_WRITE);
+    if(!cm->send_mr||!cm->recv_mr)
+    {
+        return -1;
+    }
+
+    cm_id->context = cm;
+
+
+    return 0;
+
+}
+
+static int rdma_free_buffer(struct rdma_cm_id *cm_id)
+{
+    conn_manager_t *cm = (conn_manager_t*)cm_id->context;
+    if(!cm)
+    {
+        return -1;
+    }
+
+    ibv_dereg_mr(cm->send_mr);
+    ibv_dereg_mr(cm->recv_mr);
+    free(cm->sbuffer); 
+    free(cm->rbuffer);
+    free(cm);
+
+    return 0;
+}
+
+
+static int rdma_post_recv(struct rdma_cm_id *cm_id,size_t slot_index)
+{
+    if(slot_index >= RDMA_RECV_SLOTS)
+    {
+        fprintf(stderr, "Invalid receive slot: %zu\n", slot_index);
+        return EINVAL;
+    }
+
+    conn_manager_t *cm = (conn_manager_t*)cm_id->context;
+
+    struct ibv_sge sge;
+    memset(&sge,0,sizeof(sge));
+    sge.addr = (uintptr_t)(cm->rbuffer + slot_index * RDMA_BUFFER_SIZE);
+    sge.length = RDMA_BUFFER_SIZE;
+    sge.lkey = cm->recv_mr->lkey;
+
+    struct ibv_recv_wr wr, *bad = NULL;
+    memset(&wr,0,sizeof(struct ibv_recv_wr));
+    wr.wr_id = slot_index;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    int ret = ibv_post_recv(cm_id->qp, &wr, &bad);
+    if(ret != 0)
+    {
+        fprintf(stderr, "ibv_post_recv failed: %s (%d)\n",strerror(ret), ret);
+    }
+
+    return ret;
+
+}
+
+static int rdma_post_send(struct rdma_cm_id *cm_id)
+{
+    conn_manager_t *cm = (conn_manager_t*)cm_id->context;
+
+    struct ibv_sge sge;
+    memset(&sge,0,sizeof(struct ibv_sge));
+    sge.addr = (uintptr_t)cm->sbuffer;
+    sge.length = RDMA_BUFFER_SIZE;
+    sge.lkey = cm->send_mr->lkey;
+
+    struct ibv_send_wr wr,*bad = NULL;
+    memset(&wr,0,sizeof(struct ibv_send_wr));
+    wr.wr_id = (uintptr_t)cm;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    return ibv_post_send(cm_id->qp,&wr,&bad);
+
+}
+
+static int rdma_poll_wc(struct ibv_cq *cq,struct ibv_wc *out)
+{
+    while(1)
+    {
+        struct ibv_wc wc;
+        int n = ibv_poll_cq(cq,1,&wc);
+        if(n<0)
+        {
+            return -1;
+        }
+        else if (n==0) 
+        {
+            usleep(0);
+            continue;
+        }
+
+        if(wc.status != IBV_WC_SUCCESS)
+        {
+            fprintf(stderr,
+            "RDMA completion failed: %s (status=%d), "
+            "qp_num=%u, vendor_err=%u\n",
+            ibv_wc_status_str(wc.status),
+            (int)wc.status,
+            wc.qp_num,
+            wc.vendor_err);
+            return -1;
+        }
+        if(out)
+        {
+            *out = wc;
+        }
+
+        return 0;
+    }
+
 
 }
 
 
+// static int open_file(const char *filename)
+// {
+//     int fd = open(filename,"rb");
+//     if(fd <0)
+//     {
+//         perror("open file failed");
+//         return -1;
+//     }
 
 
 
-
+// }
 
 
 #endif
