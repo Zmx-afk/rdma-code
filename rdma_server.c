@@ -86,21 +86,38 @@ int main()
     rdma_wait_cm_event(id->channel,RDMA_CM_EVENT_ESTABLISHED,NULL);
 
     struct ibv_wc wc;
-    if(0!=rdma_poll_wc(cq,&wc)||wc.opcode != IBV_WC_RECV)
+    if (rdma_poll_wc(cq, &wc) != 0)
     {
-        perror("rdma_poll_Wc");
-        return 0;
+        return EXIT_FAILURE;
     }
-    
+
+    if (wc.opcode != IBV_WC_RECV || wc.wr_id != 0 ||
+        wc.byte_len < sizeof(file_type_t) ||
+        wc.byte_len > RDMA_BUFFER_SIZE)
+    {
+        fprintf(stderr, "Invalid file header completion\n");
+        return EXIT_FAILURE;
+    }
+
     conn_manager_t *cm = id->context;
-    printf("recv:%s\n",cm->rbuffer);
+    file_type_t type = {0};
+    memcpy(&type, cm->rbuffer, sizeof(type));
 
+    if (type.magic != 0x12345678)
+    {
+        fprintf(stderr, "Invalid file header magic\n");
+        return EXIT_FAILURE;
+    }
 
-    file_type_t *type = (file_type_t*)cm->rbuffer;
-    uint32_t magic = type->magic;
-    size_t total = type->total;
+    size_t total = type.total;
+    off_t file_size = (off_t)total;
 
-    printf("magic = 0x%x,total = %ld\n",magic,total);
+    if (file_size < 0 || (uintmax_t)file_size != (uintmax_t)total)
+    {
+        fprintf(stderr, "File size is not representable as off_t\n");
+        return EXIT_FAILURE;
+    }
+
 
     int fd = open("b.txt",O_RDWR | O_CREAT, 0666);
     if(fd <0)
@@ -109,13 +126,22 @@ int main()
         return -1;
     }
 
-    ftruncate(fd,total);            //创建一个指定大小的文件
-
-    char *p = (char*)mmap(NULL, total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if(p==MAP_FAILED)
+    if (ftruncate(fd, file_size) != 0)          //创建一个指定大小的文件
     {
-        perror("mmap failed");
-        return -1;
+        perror("ftruncate");
+        return EXIT_FAILURE;
+    }            
+
+    char *p = NULL;
+
+    if (total > 0)
+    {
+        p = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED)
+        {
+            perror("mmap failed");
+            return EXIT_FAILURE;
+        }
     }
 
     size_t total_chunks = total / RDMA_BUFFER_SIZE;
@@ -136,17 +162,67 @@ int main()
         posted_chunks++;
     }
 
-    size_t idx = 0;
+    int control_send_pending = 0;
 
-    while(idx < total)
+    if (posted_chunks > 0)
     {
+        if (rdma_post_control(id, RDMA_CTRL_CREDIT,
+                              posted_chunks) != 0)
+        {
+            return EXIT_FAILURE;
+        }
+
+        control_send_pending = 1;
+
+        printf("Initial send limit: %zu chunks\n", posted_chunks);
+    }
+
+    size_t idx = 0;
+    size_t received_chunks = 0;
+
+    while (idx < total || control_send_pending)
+    {
+        if (received_chunks == posted_chunks && posted_chunks < total_chunks && !control_send_pending)
+        {
+            for (size_t slot = 0;slot < RDMA_RECV_SLOTS && posted_chunks < total_chunks; slot++)
+            {
+                if (rdma_post_recv(id, slot) != 0)
+                {
+                    return EXIT_FAILURE;
+                }
+
+                posted_chunks++;
+            }
+
+            if (rdma_post_control(id, RDMA_CTRL_CREDIT,
+                                  posted_chunks) != 0)
+            {
+                return EXIT_FAILURE;
+            }
+
+            control_send_pending = 1;
+
+            printf("Updated send limit: %zu chunks\n", posted_chunks);
+        }
 
         if(rdma_poll_wc(cq, &wc) != 0)
         {
             return EXIT_FAILURE;
         }
 
-        if(wc.opcode != IBV_WC_RECV)
+        if (wc.opcode == IBV_WC_SEND)
+        {
+            if (!control_send_pending)
+            {
+                fprintf(stderr, "Unexpected control send completion\n");
+                return EXIT_FAILURE;
+            }
+
+            control_send_pending = 0;
+            continue;
+        }
+
+        if (wc.opcode != IBV_WC_RECV)
         {
             fprintf(stderr, "Unexpected completion opcode: %d\n",
                     (int)wc.opcode);
@@ -159,46 +235,117 @@ int main()
             return EXIT_FAILURE;
         }
 
+        if (wc.byte_len != RDMA_BUFFER_SIZE)
+        {
+            fprintf(stderr, "Invalid data message length: %u\n", wc.byte_len);
+            return EXIT_FAILURE;
+        }
+
+        if (received_chunks >= posted_chunks || idx >= total)
+        {
+            fprintf(stderr, "Received data beyond the expected amount\n");
+            return EXIT_FAILURE;
+        }
+
         size_t slot_index = (size_t)wc.wr_id;
         char *recv_data = cm->rbuffer + slot_index * RDMA_BUFFER_SIZE;
-        printf("recv slot=%zu, file offset=%zu, received bytes=%u\n",slot_index, idx, wc.byte_len);
-
-        if(idx + RDMA_BUFFER_SIZE < total)
+        size_t chunk_size = total - idx;
+        if (chunk_size > RDMA_BUFFER_SIZE)
         {
-            memcpy(p+idx,recv_data,RDMA_BUFFER_SIZE);
-            idx += RDMA_BUFFER_SIZE;
-        }
-        else
-        {
-            memcpy(p+idx,recv_data,total-idx);
-            idx = total;
+            chunk_size = RDMA_BUFFER_SIZE;
         }
 
-        if(posted_chunks < total_chunks)
-        {
-            if(rdma_post_recv(id, slot_index) != 0)
-            {
-                return EXIT_FAILURE;
-            }
+        // printf("recv slot=%zu, file offset=%zu, received bytes=%u, file bytes=%zu\n",
+        //        slot_index, idx, wc.byte_len, chunk_size);
 
-            posted_chunks++;
-        }
+        memcpy(p + idx, recv_data, chunk_size);
+        idx += chunk_size;
+        received_chunks++;
 
     }
-    msync(p,total,MS_SYNC);
-    munmap(p,total);
-    close(fd);
-
-
-    sprintf(cm->sbuffer,"sync finish");
-    rdma_post_send(id);
-    if(0!=rdma_poll_wc(cq,&wc)||wc.opcode != IBV_WC_SEND)
+    
+    if (received_chunks != total_chunks)
     {
-        perror("rdma_poll_wc");
-        return 0;
+        fprintf(stderr, "Received chunk count does not match file size\n");
+        return EXIT_FAILURE;
     }
 
-    rdma_free_buffer(cm_id);
-    rdma_destroy_queuepair(cm_id,pd,cq);
+    if (total > 0 && msync(p, total, MS_SYNC) != 0)
+    {
+        perror("msync");
+        return EXIT_FAILURE;
+    }
+
+    if (fsync(fd) != 0)
+    {
+        perror("fsync");
+        return EXIT_FAILURE;
+    }
+
+    if (total > 0 && munmap(p, total) != 0)
+    {
+        perror("munmap");
+        return EXIT_FAILURE;
+    }
+
+    if (close(fd) != 0)
+    {
+        perror("close output file");
+        return EXIT_FAILURE;
+    }
+
+    if (rdma_post_control(id, RDMA_CTRL_DONE, 0) != 0)
+    {
+        return EXIT_FAILURE;
+    }
+
+    if (rdma_poll_wc(cq, &wc) != 0)
+    {
+        return EXIT_FAILURE;
+    }
+
+    if (wc.opcode != IBV_WC_SEND)
+    {
+        fprintf(stderr, "Unexpected completion while waiting for DONE send: %d\n",
+                (int)wc.opcode);
+        return EXIT_FAILURE;
+    }
+
+    printf("Received and synchronized %zu file bytes\n", total);
+
+        if (rdma_wait_cm_event(channel, RDMA_CM_EVENT_DISCONNECTED, NULL) != 0)
+    {
+        return EXIT_FAILURE;
+    }
+
+    if (rdma_disconnect(id) != 0)
+    {
+        perror("rdma_disconnect");
+        return EXIT_FAILURE;
+    }
+
+    rdma_destroy_qp(id);
+
+    if (rdma_free_buffer(id) != 0)
+    {
+        return EXIT_FAILURE;
+    }
+
+    rdma_destroy_queuepair(id, pd, cq);
+
+    if (rdma_destroy_id(id) != 0)
+    {
+        perror("rdma_destroy_id connection");
+        return EXIT_FAILURE;
+    }
+
+    if (rdma_destroy_id(cm_id) != 0)
+    {
+        perror("rdma_destroy_id listener");
+        return EXIT_FAILURE;
+    }
+
+    rdma_destroy_event_channel(channel);
+    return EXIT_SUCCESS;
 
 }

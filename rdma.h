@@ -36,9 +36,18 @@ typedef struct conn_manager_s
 
 typedef struct file_type_s
 {
-    uint32_t magic;
-    size_t total;
+    uint32_t magic;             //文件魔数
+    size_t total;               //文件总大小
 }file_type_t;
+
+#define RDMA_CTRL_CREDIT 1
+#define RDMA_CTRL_DONE   2
+
+typedef struct control_msg_s
+{
+    uint64_t type;
+    uint64_t send_limit;
+} control_msg_t;
 
 static int rdma_wait_cm_event(struct rdma_event_channel *channel, enum rdma_cm_event_type expect,struct rdma_cm_event **out)
 {
@@ -222,6 +231,27 @@ static int rdma_post_send(struct rdma_cm_id *cm_id)
 
     return ibv_post_send(cm_id->qp,&wr,&bad);
 
+}
+
+static int rdma_post_control(struct rdma_cm_id *cm_id,uint64_t message_type,uint64_t send_limit)
+{
+    conn_manager_t *cm = (conn_manager_t *)cm_id->context;
+
+    control_msg_t message = {0};
+    message.type = message_type;
+    message.send_limit = send_limit;
+
+    memset(cm->sbuffer, 0, RDMA_BUFFER_SIZE);
+    memcpy(cm->sbuffer, &message, sizeof(message));
+
+    int ret = rdma_post_send(cm_id);
+    if(ret != 0)
+    {
+        fprintf(stderr, "Send control message failed: %s (%d)\n",
+                strerror(ret), ret);
+    }
+
+    return ret;
 }
 
 static int rdma_poll_wc(struct ibv_cq *cq,struct ibv_wc *out)

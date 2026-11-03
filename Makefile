@@ -1,12 +1,11 @@
 CC := gcc
 CFLAGS := -Wall -O2 -g
-LIBS := -lrdmacm -libverbs
-TARGET := rdma_server
+LDLIBS := -lrdmacm -libverbs
+TARGETS := rdma_server rdma_client
 
 
-$(TARGET): rdma_server.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
+$(TARGETS): %: %.c rdma.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
-.PHONY: clean
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
